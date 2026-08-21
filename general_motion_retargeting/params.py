@@ -7,6 +7,7 @@ ASSET_ROOT = HERE / ".." / "assets"
 ROBOT_XML_DICT = {
     "unitree_g1": ASSET_ROOT / "unitree_g1" / "g1_mocap_29dof.xml",
     "unitree_g1_with_hands": ASSET_ROOT / "unitree_g1" / "g1_mocap_29dof_with_hands.xml",
+    "unitree_g1_upper": ASSET_ROOT / "unitree_g1" / "g1_mocap_29dof.xml",
     "unitree_h1": ASSET_ROOT / "unitree_h1" / "h1.xml",
     "unitree_h1_2": ASSET_ROOT / "unitree_h1_2" / "h1_2_handless.xml",
     "booster_t1": ASSET_ROOT / "booster_t1" / "T1_serial.xml",
@@ -72,6 +73,7 @@ IK_CONFIG_DICT = {
     
     "xrobot":{
         "unitree_g1": IK_CONFIG_ROOT / "xrobot_to_g1.json",
+        "unitree_g1_upper": IK_CONFIG_ROOT / "xrobot_upper_to_g1.json",
     },
     "xsens_mvn": {
         "unitree_g1": IK_CONFIG_ROOT / "xsens_mvn_to_g1.json",

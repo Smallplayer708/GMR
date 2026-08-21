@@ -6,15 +6,682 @@ except:
     print("[bold red]xrobotoolkit_sdk not found, skip for now. If you do not use XRobotStreamer, it's fine.[/bold red]")
 import time
 import numpy as np
-from .rot_utils import quat_mul_np
+from .rot_utils import quat_mul_np, quat_rotate_inverse_np
 from scipy.spatial.transform import Rotation as R
 import json
 import cv2
 import os
 
+DEFAULT_TEMPLATE_PATH = os.path.join(os.path.expanduser("~"), ".xrobotkit", "standing_template.json")
+
+UPPER_BODY_JOINT_NAMES = [
+    "Pelvis", "Spine3", "Head",
+    "Left_Shoulder", "Left_Elbow", "Left_Wrist",
+    "Right_Shoulder", "Right_Elbow", "Right_Wrist",
+]
+
+# ============================= Step 1: math helpers (upper-body skeleton) =============================
+
+def _qmul(q1, q2):
+    """Multiply two quaternions (scalar-first [w, x, y, z])."""
+    return quat_mul_np(np.asarray(q1, dtype=float), np.asarray(q2, dtype=float), scalar_first=True)
+
+
+def _qconj(q):
+    q = np.asarray(q, dtype=float)
+    return np.array([q[0], -q[1], -q[2], -q[3]])
+
+
+def _qnormalize(q):
+    q = np.asarray(q, dtype=float)
+    n = float(np.linalg.norm(q))
+    if n < 1e-8:
+        return np.array([1.0, 0.0, 0.0, 0.0])
+    return q / n
+
+
+def _qrotate(q, v):
+    """Rotate vector v by quaternion q (forward rotation, scalar-first)."""
+    return quat_rotate_inverse_np(_qconj(q), np.asarray(v, dtype=float), scalar_first=True)
+
+
+def _quat_yaw(q):
+    """World yaw (radians, rotation about the up axis +Y) of a scalar-first quaternion."""
+    q = np.asarray(q, dtype=float)
+    w, x, y, z = q
+    return float(np.arctan2(2.0 * (w * y - x * z), 1.0 - 2.0 * (y * y + z * z)))
+
+
+def _yaw_quat(yaw):
+    """Upright quaternion with only a world yaw rotation (about +Y)."""
+    c, s = np.cos(yaw / 2.0), np.sin(yaw / 2.0)
+    return np.array([c, 0.0, s, 0.0])
+
+
+def _world_up_y(quat):
+    """Y component of the frame's up axis after rotating world +Y by `quat`."""
+    up = _qrotate(np.asarray(quat, dtype=float), np.array([0.0, 1.0, 0.0]))
+    return float(up[1])
+
+
+def _qslerp(q1, q2, t):
+    """Spherical linear interpolation between two quaternions (scalar-first)."""
+    q1 = np.asarray(q1, dtype=float)
+    q2 = np.asarray(q2, dtype=float)
+    d = float(np.clip(np.dot(q1, q2), -1.0, 1.0))
+    if d < 0.0:
+        q2 = -q2
+        d = -d
+    if d > 0.9995:
+        res = q1 + t * (q2 - q1)
+    else:
+        th = np.arccos(d)
+        sth = np.sin(th)
+        res = (np.sin((1.0 - t) * th) * q1 + np.sin(t * th) * q2) / sth
+    return _qnormalize(res)
+
+
+def _blend_body_dicts(dict_a, dict_b, t):
+    """Per-joint lerp (position) + slerp (orientation) blend of two body dicts."""
+    out = {}
+    for name in dict_b.keys():
+        pa = np.asarray(dict_a[name][0], dtype=float)
+        qa = np.asarray(dict_a[name][1], dtype=float)
+        pb = np.asarray(dict_b[name][0], dtype=float)
+        qb = np.asarray(dict_b[name][1], dtype=float)
+        out[name] = [(pa + t * (pb - pa)).tolist(), _qslerp(qa, qb, t).tolist()]
+    return out
+
+
+def _pose7_valid(pose7):
+    """A pose is valid only when its position is non-zero (SDK returns zeros when no data)."""
+    if pose7 is None or len(pose7) < 7:
+        return False
+    return float(np.linalg.norm(np.asarray(pose7[:3], dtype=float))) > 1e-3
+
+
+ELBOW_LOCK_ANGLE = np.deg2rad(170.0)
+
+
+def _arm_max_reach(l1, l2):
+    """Max shoulder-wrist distance before the elbow hits its lock angle (rigid arm, slight bend)."""
+    return float(np.sqrt(max(l1 * l1 + l2 * l2 - 2.0 * l1 * l2 * np.cos(ELBOW_LOCK_ANGLE), 0.0)))
+
+
+def _quat_angle(q1, q2):
+    """Angular distance (rad) between two quaternions."""
+    q1, q2 = np.asarray(q1, dtype=float), np.asarray(q2, dtype=float)
+    d = float(min(np.linalg.norm(q1 - q2), np.linalg.norm(q1 + q2)))
+    return 2.0 * float(np.arcsin(np.clip(d / 2.0, 0.0, 1.0)))
+
+
+def _flip_about_axis(quat, axis):
+    """Rotate a quaternion 180 deg about a unit axis (undoes elbow-frame azimuth flips)."""
+    q_axis = R.from_rotvec(np.asarray(axis, dtype=float) * np.pi).as_quat(scalar_first=True)
+    return _qmul(q_axis, quat)
+
+
+# ---- self-check optimization knobs (mutated by SelfCheckMonitor.optimize) ----
+XU_WRIST_P0_LAT = 0.04        # standing wrist lateral correction (m)
+XU_ELBOW_P0_LAT_L = 0.04      # standing elbow lateral target, left (m)
+XU_ELBOW_P0_LAT_R = 0.04      # standing elbow lateral target, right (m)
+XU_ELBOW_P0_FWD = 0.04        # standing elbow forward target (m)
+XU_ELBOW_P0_DY = 0.05         # standing elbow lowering (m)
+XU_ENV_W = 25.0               # phi-grid envelope weight (self-check raises it vs elbow_high)
+
+
+def _circle_geometry(shoulder, wrist, l1, l2, pole):
+    """2-bone solution circle geometry: returns S, W, u0, a, h, C, pdir, perp.
+
+    pdir = reference azimuth (pole projection on the circle plane, world-down fallback),
+    perp = cross(u0, pdir); elbow on the circle = C + h*(cos(phi)*pdir + sin(phi)*perp).
+    """
+    S = np.asarray(shoulder, dtype=float)
+    W = np.asarray(wrist, dtype=float)
+    d_vec = W - S
+    raw_d = float(np.linalg.norm(d_vec))
+    if raw_d < 1e-6:
+        return None
+    u0 = d_vec / raw_d
+    d_max = _arm_max_reach(l1, l2)
+    d = float(np.clip(raw_d, abs(l1 - l2) + 1e-4, d_max))
+    a = float(np.clip((l1 * l1 - l2 * l2 + d * d) / (2.0 * d), 0.0, l1 - 1e-6))
+    h = float(np.sqrt(max(l1 * l1 - a * a, 0.0)))
+    C = S + a * u0
+    pdir = None
+    if pole is not None:
+        p = np.asarray(pole, dtype=float)
+        g = p - u0 * float(np.dot(p, u0))
+        ng = float(np.linalg.norm(g))
+        if ng > 1e-6:
+            pdir = g / ng
+    if pdir is None:
+        ref = np.array([0.0, -1.0, 0.0])  # world down
+        g = ref - u0 * float(np.dot(ref, u0))
+        ng = float(np.linalg.norm(g))
+        if ng < 1e-6:
+            for cand in (np.array([1.0, 0.0, 0.0]), np.array([0.0, 0.0, 1.0])):
+                g = cand - u0 * float(np.dot(cand, u0))
+                ng = float(np.linalg.norm(g))
+                if ng > 1e-6:
+                    break
+        pdir = g / ng
+    perp = np.cross(u0, pdir)
+    return S, W, u0, a, h, C, pdir, perp
+
+
+def _elbow_phi_grid(shoulder, wrist, l1, l2, pole, phi_learned, pelvis_quat, side, phi_prev=None,
+                      circle=None):
+    """Constrained 1-DOF elbow-azimuth optimization (L2/L3 revised).
+
+    Minimizes a naturalness cost over the circle azimuth phi:
+        w1*|phi - phi_learned|^2  (operator prior, when available)
+      + w2*|phi|^2               (pull toward the natural body-frame pole)
+      + w3*|phi - phi_prev|^2    (temporal coherence, prevents per-frame argmin jumps)
+      + hard penalties for violating the position envelope:
+          - the elbow must stay on the arm's outward side of the shoulder (no adduction
+            past the midline / no crossed arms),
+          - the elbow must not go farther than 0.25 m behind the shoulder (no "elbow
+            behind the torso").
+    """
+    g = circle if circle is not None else _circle_geometry(shoulder, wrist, l1, l2, pole)
+    if g is None:
+        return 0.0
+    _, _, u0, a, h, C, pdir, perp = g
+    pq = np.asarray(pelvis_quat, dtype=float)
+    sign = 1.0 if side == "Left" else -1.0  # left: elbow at/left of shoulder; right: at/right
+    # near-vertical (hanging) arms: the natural elbow points backward; forbid poking forward
+    vertical = float(np.dot(u0, np.array([0.0, -1.0, 0.0]))) > 0.90
+    # when the wrist is below the shoulder the elbow must hang below the shoulder line
+    # (fixes the "elbow hovering above the shoulder" standing pose: the circle is
+    # vertical for a wrist at shoulder height and phi would otherwise be free to lift)
+    wrist_below = float(np.asarray(wrist, dtype=float)[1] - np.asarray(shoulder, dtype=float)[1]) < 0.0
+    best_phi, best_cost = 0.0, float("inf")
+    for phi in np.linspace(-np.pi, np.pi, 73):
+        E = C + h * (np.cos(phi) * pdir + np.sin(phi) * perp)
+        Eb = _qrotate(_qconj(pq), E - np.asarray(shoulder, dtype=float))
+        lat_viol = max(0.0, sign * Eb[0] - 0.06)
+        back_viol = max(0.0, -Eb[2] - 0.25)
+        fwd_viol = max(0.0, Eb[2] - 0.05) if vertical else 0.0
+        up_viol = max(0.0, Eb[1] - 0.02) if wrist_below else 0.0
+        cost = (8.0 * (phi - phi_learned) ** 2) if phi_learned is not None else 0.0
+        cost += 0.3 * phi * phi
+        if phi_prev is not None:
+            dphi_t = np.arctan2(np.sin(phi - phi_prev), np.cos(phi - phi_prev))
+            cost += 0.5 * dphi_t * dphi_t
+        cost += XU_ENV_W * (lat_viol + back_viol + fwd_viol + up_viol)
+        if cost < best_cost:
+            best_cost, best_phi = cost, phi
+    return float(best_phi)
+
+
+def _two_bone_ik(shoulder, wrist, l1, l2, prev_elbow=None, pole=None, phi=None, circle=None):
+    """Analytic 2-bone IK: elbow position from shoulder S, wrist W, upper-arm l1, forearm l2.
+
+    The elbow lies on a circle perpendicular to the S-W axis (radius h, center C). The
+    azimuth on that circle is set by, in priority order: `prev_elbow` (temporal
+    continuity, prevents flips), `pole` (natural elbow direction, e.g. torso-biased
+    gravity), or world down (fallback). Unreachable targets clamp to the elbow lock
+    angle (170 deg) so the arm keeps a slight natural bend instead of a straight line.
+    """
+    S = np.asarray(shoulder, dtype=float)
+    W = np.asarray(wrist, dtype=float)
+    d_vec = W - S
+    raw_d = float(np.linalg.norm(d_vec))
+    if raw_d < 1e-6:
+        return S + np.array([0.0, -l1, 0.0])
+    u0 = d_vec / raw_d
+    d_max = _arm_max_reach(l1, l2)
+    d = float(np.clip(raw_d, abs(l1 - l2) + 1e-4, d_max))
+    a = float(np.clip((l1 * l1 - l2 * l2 + d * d) / (2.0 * d), 0.0, l1 - 1e-6))
+    h = float(np.sqrt(max(l1 * l1 - a * a, 0.0)))
+    C = S + a * u0
+    # reference azimuth direction on the circle plane: pole projection (or world-down fallback)
+    pdir = None
+    if pole is not None:
+        p = np.asarray(pole, dtype=float)
+        g = p - u0 * float(np.dot(p, u0))
+        ng = float(np.linalg.norm(g))
+        if ng > 1e-6:
+            pdir = g / ng
+    if pdir is None:
+        ref = np.array([0.0, -1.0, 0.0])  # world down
+        g = ref - u0 * float(np.dot(ref, u0))
+        ng = float(np.linalg.norm(g))
+        if ng < 1e-6:
+            for cand in (np.array([1.0, 0.0, 0.0]), np.array([0.0, 0.0, 1.0])):
+                g = cand - u0 * float(np.dot(cand, u0))
+                ng = float(np.linalg.norm(g))
+                if ng > 1e-6:
+                    break
+        pdir = g / ng
+    if phi is not None:
+        if circle is not None:
+            _, _, _, _, hh, Cc, pp, pe = circle
+            return Cc + hh * (np.cos(phi) * pp + np.sin(phi) * pe)
+        perp = np.cross(u0, pdir)
+        return C + h * (np.cos(phi) * pdir + np.sin(phi) * perp)
+    if prev_elbow is not None:
+        v = np.asarray(prev_elbow, dtype=float) - C
+        v_plane = v - u0 * float(np.dot(v, u0))
+        nv = float(np.linalg.norm(v_plane))
+        if nv > 1e-6:
+            return C + h * (v_plane / nv)
+    return C + h * pdir
+
+
+def _forearm_frame_quat(fore_dir):
+    """Build an elbow-frame quaternion: x-axis along the forearm, y as up as possible, z = x * y."""
+    x = np.asarray(fore_dir, dtype=float)
+    xn = float(np.linalg.norm(x))
+    if xn < 1e-6:
+        return np.array([1.0, 0.0, 0.0, 0.0])
+    x = x / xn
+    y = np.array([0.0, 1.0, 0.0]) - x * np.dot(x, np.array([0.0, 1.0, 0.0]))
+    yn = float(np.linalg.norm(y))
+    if yn < 1e-4:
+        for cand in (np.array([0.0, 0.0, 1.0]), np.array([1.0, 0.0, 0.0])):
+            y = cand - x * np.dot(x, cand)
+            yn = float(np.linalg.norm(y))
+            if yn > 1e-4:
+                break
+    if yn < 1e-6:
+        return np.array([1.0, 0.0, 0.0, 0.0])
+    y = y / yn
+    z = np.cross(x, y)
+    return R.from_matrix(np.stack([x, y, z], axis=1)).as_quat(scalar_first=True)
+
+
+class StandingTemplate:
+    """Full-body standing skeleton stored as pelvis-relative joint poses (raw PICO frame).
+
+    Loaded from a captured template file (e.g. ~/.xrobotkit/standing_template.json,
+    VERSION 2, incl. controller->wrist and geometric->elbow arm calibration) or
+    generated procedurally from human height. `compose()` re-anchors the skeleton at an
+    arbitrary pelvis pose; `arm_lengths()` returns per-side arm link lengths.
+    """
+
+    VERSION = 2
+
+    def __init__(self, joints, pelvis_from_head, pelvis_quat,
+                 controller_to_wrist=None, geo_to_elbow=None):
+        self.joints = joints  # name -> (rel_pos(3), rel_quat(4), scalar-first)
+        self.pelvis_from_head = pelvis_from_head  # (pos(3), quat(4)) pelvis expressed in head frame
+        self.pelvis_quat = np.asarray(pelvis_quat, dtype=float)
+        # side -> (pos_offset(3) in controller frame, quat(4)) ; None when not calibrated
+        self.controller_to_wrist = controller_to_wrist or {}
+        # side -> quat(4) ; None when not calibrated
+        self.geo_to_elbow = geo_to_elbow or {}
+
+    def compose(self, pelvis_pos, pelvis_quat=None):
+        """Rebuild the full 24-joint dict anchored at the given pelvis pose (raw PICO frame)."""
+        pelvis_quat = self.pelvis_quat if pelvis_quat is None else np.asarray(pelvis_quat, dtype=float)
+        out = {}
+        for name, (rel_pos, rel_quat) in self.joints.items():
+            pos = np.asarray(pelvis_pos, dtype=float) + _qrotate(pelvis_quat, rel_pos)
+            quat = _qmul(pelvis_quat, rel_quat)
+            out[name] = [pos.tolist(), _qnormalize(quat).tolist()]
+        return out
+
+    def arm_lengths(self):
+        """Upper-arm / forearm lengths for both sides, derived from the template."""
+        lengths = {}
+        for side in ("Left", "Right"):
+            sh = np.asarray(self.joints[side + "_Shoulder"][0], dtype=float)
+            el = np.asarray(self.joints[side + "_Elbow"][0], dtype=float)
+            wr = np.asarray(self.joints[side + "_Wrist"][0], dtype=float)
+            lengths[side] = (float(np.linalg.norm(el - sh)), float(np.linalg.norm(wr - el)))
+        return lengths
+
+    @staticmethod
+    def load(path):
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            joints = {}
+            for name, v in data["joints"].items():
+                joints[name] = (np.asarray(v["pos"], dtype=float), np.asarray(v["quat"], dtype=float))
+            phf = (np.asarray(data["pelvis_from_head"]["pos"], dtype=float),
+                   np.asarray(data["pelvis_from_head"]["quat"], dtype=float))
+            ctw = {}
+            for side, v in data.get("controller_to_wrist", {}).items():
+                ctw[side] = (np.asarray(v["pos"], dtype=float), np.asarray(v["quat"], dtype=float))
+            gte = {side: np.asarray(v, dtype=float)
+                   for side, v in data.get("geo_to_elbow", {}).items()}
+            return StandingTemplate(joints, phf, np.asarray(data["pelvis_quat"], dtype=float), ctw, gte)
+        except Exception as e:
+            print(f"[StandingTemplate] 加载站立模板失败，将使用参数化默认站姿: {e}")
+            return None
+
+    @staticmethod
+    def parametric(height=1.7):
+        """Procedural standing skeleton from human height (fallback when no capture exists).
+
+        Proportions (fractions of height H, ground at 0): pelvis 0.53H, knee 0.28H,
+        ankle 0.04H, head/eye 0.93H; torso pelvis->shoulder 0.28H, hip width 0.2,
+        shoulder width 0.22. All joints are pelvis-relative (raw PICO frame, y up).
+        """
+        H = float(height)
+        ident = [1.0, 0.0, 0.0, 0.0]
+
+        def j(x, y, z):
+            return ([float(x), float(y), float(z)], list(ident))
+
+        shoulder_y = 0.28 * H
+        elbow_y = shoulder_y - 0.19 * H
+        wrist_y = elbow_y - 0.16 * H
+        joints = {
+            "Pelvis": j(0.0, 0.0, 0.0),
+            "Left_Hip": j(-0.10, -0.02, 0.0),
+            "Right_Hip": j(0.10, -0.02, 0.0),
+            "Spine1": j(0.0, 0.12 * H, 0.0),
+            "Left_Knee": j(-0.10, -0.24 * H, 0.0),
+            "Right_Knee": j(0.10, -0.24 * H, 0.0),
+            "Spine2": j(0.0, 0.21 * H, 0.0),
+            "Left_Ankle": j(-0.10, -0.49 * H, 0.0),
+            "Right_Ankle": j(0.10, -0.49 * H, 0.0),
+            "Spine3": j(0.0, 0.29 * H, 0.0),
+            "Left_Foot": j(-0.10, -0.52 * H, 0.05),
+            "Right_Foot": j(0.10, -0.52 * H, 0.05),
+            "Neck": j(0.0, 0.32 * H, 0.0),
+            "Left_Collar": j(-0.04, 0.30 * H, 0.0),
+            "Right_Collar": j(0.04, 0.30 * H, 0.0),
+            "Head": j(0.0, 0.40 * H, 0.03),
+            "Left_Shoulder": j(-0.11, shoulder_y, 0.0),
+            "Right_Shoulder": j(0.11, shoulder_y, 0.0),
+            "Left_Elbow": j(-0.16, elbow_y, 0.0),
+            "Right_Elbow": j(0.16, elbow_y, 0.0),
+            "Left_Wrist": j(-0.16, wrist_y, 0.0),
+            "Right_Wrist": j(0.16, wrist_y, 0.0),
+            "Left_Hand": j(-0.16, wrist_y, 0.0),
+            "Right_Hand": j(0.16, wrist_y, 0.0),
+        }
+        pelvis_from_head = (j(0.0, -0.40 * H, 0.0)[0], ident)
+        return StandingTemplate(joints, pelvis_from_head, np.array(ident, dtype=float),
+                                controller_to_wrist={}, geo_to_elbow={})
+
+
+def synthesize_upper_body(head_pose7, left_controller7, right_controller7, template,
+                          prev_elbows=None, arm_lengths=None, elbow_prior=None):
+    """Build the 9-joint upper-body dict (raw PICO frame) from live head + controllers + template.
+
+    - Pelvis: template anchored straight below the live head, upright, yaw follows the live head
+    - Spine3 / Shoulders: from the template (fixed torso)
+    - Head: live headset pose
+    - Wrists: live controller poses corrected by the template controller->wrist calibration
+    - Elbows: analytic 2-bone IK with the template arm lengths; the IK branch keeps temporal
+      continuity via `prev_elbows`; orientation = geometric forearm frame corrected by the
+      template geo->elbow calibration.
+    Returns (body_dict, new_prev_elbows). All data in the raw PICO (Unity left-handed) frame.
+    """
+    head_pos = np.asarray(head_pose7[:3], dtype=float)
+    head_quat = np.asarray([head_pose7[6], head_pose7[3], head_pose7[4], head_pose7[5]], dtype=float)
+
+    pelvis_quat = _yaw_quat(_quat_yaw(head_quat))
+    pelvis_from_head_pos = np.asarray(template.pelvis_from_head[0], dtype=float)
+    pelvis_pos = head_pos + np.array([0.0, pelvis_from_head_pos[1], 0.0])
+    body = template.compose(pelvis_pos, pelvis_quat)
+
+    body["Head"] = [head_pos.tolist(), _qnormalize(head_quat).tolist()]
+
+    lengths = arm_lengths or template.arm_lengths()
+    new_prev = dict(prev_elbows) if prev_elbows else {}
+    spine3_pos = np.asarray(body["Spine3"][0], dtype=float)
+
+    for side, ctrl7 in (("Left", left_controller7), ("Right", right_controller7)):
+        shoulder = np.asarray(body[side + "_Shoulder"][0], dtype=float)
+        l1, l2 = lengths[side]
+        if l1 < 1e-4 or l2 < 1e-4:
+            continue
+        wrist_pos = np.asarray(body[side + "_Wrist"][0], dtype=float)
+        wrist_quat = np.asarray(body[side + "_Wrist"][1], dtype=float)
+        if _pose7_valid(ctrl7):
+            ctrl_q = np.asarray(ctrl7[3:7], dtype=float)
+            if abs(float(np.linalg.norm(ctrl_q)) - 1.0) < 0.05:
+                if float(np.linalg.norm(np.asarray(ctrl7[:3], dtype=float) - shoulder)) < 1.0:
+                    wrist_pos = np.asarray(ctrl7[:3], dtype=float)
+                    # input cleaning on the raw controller position (valid frames only):
+                    # a 5-frame median filter removes isolated tracking glitches (up to
+                    # ~60 cm single-frame spikes) while fast but monotonic motion passes
+                    # through unchanged (magnitude thresholds cannot tell them apart).
+                    ring = new_prev.get(side + "_ctrl_ring")
+                    if ring is None:
+                        ring = []
+                    ring.append(wrist_pos.copy())
+                    if len(ring) > 5:
+                        ring.pop(0)
+                    if len(ring) >= 3:
+                        wrist_pos = np.median(np.array(ring), axis=0)
+                    new_prev[side + "_ctrl_ring"] = ring
+                    wrist_quat = np.asarray([ctrl7[6], ctrl7[3], ctrl7[4], ctrl7[5]], dtype=float)
+                    calib = template.controller_to_wrist.get(side)
+                    if calib is not None:
+                        pos_offset, quat_offset = calib
+                        wrist_pos = wrist_pos + _qrotate(wrist_quat, pos_offset)
+                        wrist_quat = _qmul(wrist_quat, quat_offset)
+        # input cleaning: reject controller position glitches (up to ~60 cm jumps observed)
+        # and lightly smooth the wrist target so the elbow/arm do not snap between frames.
+
+        # rigid skeleton: clamp the wrist into the arm's reach (keeps bone lengths constant)
+        sw = wrist_pos - shoulder
+        sw_len = float(np.linalg.norm(sw))
+        max_reach = _arm_max_reach(l1, l2)
+        if sw_len > max_reach and sw_len > 1e-6:
+            wrist_pos = shoulder + (sw / sw_len) * max_reach
+        # natural-rest wrist correction: the operator holds the controllers slightly in front
+        # of the body, so a hanging arm's wrist sits forward of the shoulder line and the
+        # forearm pokes forward. When the arm hangs (wrist below the shoulder), blend the
+        # wrist's horizontal position toward hanging directly below the shoulder - the
+        # forearm then hangs vertically and the robot arm does not swing out/back. The
+        # correction ramps in with depth below the shoulder to avoid a threshold snap.
+        depth = float(shoulder[1] - wrist_pos[1])
+        if depth > 0.10:
+            w = float(min(1.0, (depth - 0.05) / 0.20))
+            back_w = _qrotate(pelvis_quat, np.array([0.0, 0.0, -1.0]))
+            lat_dir = np.array([-1.0, 0.0, 0.0]) if side == "Left" else np.array([1.0, 0.0, 0.0])
+            lat_w = _qrotate(pelvis_quat, lat_dir)
+            # wrist hangs slightly OUTWARD of the shoulder line (G1 natural stance: arms
+            # slightly abducted, clears the thigh for forward raises)
+            target_h = np.asarray([shoulder[0] + 0.00 * back_w[0] + XU_WRIST_P0_LAT * lat_w[0],
+                                   shoulder[2] + 0.00 * back_w[2] + XU_WRIST_P0_LAT * lat_w[2]], dtype=float)
+            cur_h = np.asarray([wrist_pos[0], wrist_pos[2]], dtype=float)
+            wrist_pos = np.asarray(wrist_pos, dtype=float)
+            dx = 0.9 * w * (target_h[0] - cur_h[0])
+            dz = 0.9 * w * (target_h[1] - cur_h[1])
+            dm = float(np.hypot(dx, dz))
+            if dm > 0.03:  # per-frame cap: no wrist-target snaps from the correction
+                dx *= 0.03 / dm; dz *= 0.03 / dm
+            wrist_pos[0] += dx
+            wrist_pos[2] += dz
+        # natural elbow pole in the BODY frame: gravity + 0.35*back + 0.2*lateral (rotated by pelvis yaw)
+        back_world = _qrotate(pelvis_quat, np.array([0.0, 0.0, -1.0]))
+        lat_dir = np.array([-1.0, 0.0, 0.0]) if side == "Left" else np.array([1.0, 0.0, 0.0])
+        lateral_world = _qrotate(pelvis_quat, lat_dir)
+        # pole = gravity + 0.3 * (desired hang-elbow horizontal direction).  The
+        # desired direction comes from the same per-side offsets the P0 correction
+        # uses (elbow ~5cm medial + fwd_off forward/back), so the phi-grid's natural
+        # azimuth IS the corrected target and the two stop fighting (previously the
+        # pole's fwd/lateral terms pinned the elbow ~15cm off the target).
+        fwd_world = _qrotate(pelvis_quat, np.array([0.0, 0.0, 1.0]))
+        fwd_off = XU_ELBOW_P0_FWD
+        p0_lat = XU_ELBOW_P0_LAT_L if side == "Left" else XU_ELBOW_P0_LAT_R
+        # hang direction must match the P0 correction target exactly:
+        # target = shoulder + p0_lat*lat_dir2 + fwd_off*forward
+        hang_dir_b = np.array([p0_lat * lat_dir[0], 0.0, fwd_off], dtype=float)
+        n_hd = float(np.linalg.norm(hang_dir_b))
+        if n_hd > 1e-6:
+            hang_dir_b = hang_dir_b / n_hd
+            hang_dir_w = _qrotate(pelvis_quat, hang_dir_b)
+            pole = np.array([0.0, -1.0, 0.0]) + 0.3 * hang_dir_w
+            pole = pole / float(np.linalg.norm(pole))
+        else:
+            pole = np.array([0.0, -1.0, 0.0])
+        # pole-based solution circle. The lateral weight (0.5) keeps the pole away from the
+        # hanging-arm direction, so the phi-0 reference (pdir) is well defined at rest and
+        # does not flip (the collinearity that caused the forward elbow + jumps).
+        circle = _circle_geometry(shoulder, wrist_pos, l1, l2, pole)
+        # learned elbow azimuth (soft prior) -> constrained 1-DOF optimization with a
+        # natural position envelope (no adduction past the midline, no elbow behind the back,
+        # and - for hanging arms - no elbow poking forward)
+        phi_learned = new_prev.get(side + "_phi_rest")
+        if phi_learned is None and elbow_prior is not None:
+            phi_learned = elbow_prior.predict(side, pelvis_quat, shoulder, wrist_pos, wrist_quat)
+        prev_phi = new_prev.get(side + "_phi")
+        phi = _elbow_phi_grid(shoulder, wrist_pos, l1, l2, pole, phi_learned, pelvis_quat, side,
+                              prev_phi, circle=circle)
+        if prev_phi is not None:
+            dphi = np.arctan2(np.sin(phi - prev_phi), np.cos(phi - prev_phi))
+            dphi = float(np.clip(dphi, -0.35, 0.35))  # cap: <=20 deg/frame
+            g = circle
+            if g is not None:
+                _, _, u0s, _, hh, Cc, pdir, perp = g
+                sign = 1.0 if side == "Left" else -1.0
+                vertical = float(np.dot(u0s, np.array([0.0, -1.0, 0.0]))) > 0.90
+                accepted = None
+                wrist_below_env = float(wrist_pos[1] - shoulder[1]) < 0.0
+                for alpha in (0.5, 0.25, 0.125, 0.0625, 0.0):
+                    phi_try = prev_phi + alpha * dphi
+                    Et = Cc + hh * (np.cos(phi_try) * pdir + np.sin(phi_try) * perp)
+                    Ebt = _qrotate(_qconj(pelvis_quat), Et - shoulder)
+                    env_ok = (sign * Ebt[0] <= 0.06 and Ebt[2] >= -0.25
+                              and (not vertical or Ebt[2] <= 0.05)
+                              and (not wrist_below_env or Ebt[1] <= 0.02))
+                    if env_ok:
+                        accepted = phi_try
+                        break  # smoothing accepted only inside the natural envelope
+                if accepted is not None:
+                    phi = accepted
+                else:
+                    phi = prev_phi + 0.0625 * dphi  # continuity fallback (no per-frame snap)
+        new_prev[side + "_phi"] = phi
+        prev = new_prev.get(side)
+        elbow_pos = _two_bone_ik(shoulder, wrist_pos, l1, l2, prev_elbow=prev, pole=pole, phi=phi,
+                                 circle=circle)
+        # natural-hang elbow: the real PICO skeleton hangs with the elbow ~2 cm FORWARD of
+        # the shoulder and the wrist ~5 cm back (forearm pointing backward, 33 deg bend).
+        # The pole puts the synth elbow behind the wrist, so for a hanging arm move the
+        # elbow's horizontal position to ~2 cm in front of the shoulder (y stays from IK).
+        depth2 = float(shoulder[1] - wrist_pos[1])
+        if depth2 > 0.10:
+            fwd_w = _qrotate(pelvis_quat, np.array([0.0, 0.0, 1.0]))
+            fnh = float(np.linalg.norm([fwd_w[0], fwd_w[2]]))
+            if fnh > 1e-4:
+                fwd_h = np.asarray([fwd_w[0], fwd_w[2]], dtype=float) / fnh
+                w2 = float(min(1.0, (depth2 - 0.05) / 0.20))
+                lat_dir2 = np.array([-1.0, 0.0, 0.0]) if side == "Left" else np.array([1.0, 0.0, 0.0])
+                lat_w2 = _qrotate(pelvis_quat, lat_dir2)
+                fwd_off = XU_ELBOW_P0_FWD
+                p0_lat = XU_ELBOW_P0_LAT_L if side == "Left" else XU_ELBOW_P0_LAT_R
+                target_eh = np.asarray([shoulder[0] + fwd_off * fwd_h[0] + p0_lat * lat_w2[0],
+                                        shoulder[2] + fwd_off * fwd_h[1] + p0_lat * lat_w2[1]], dtype=float)
+                elbow_pos = np.asarray(elbow_pos, dtype=float)
+                dx = w2 * (target_eh[0] - elbow_pos[0])
+                dz = w2 * (target_eh[1] - elbow_pos[1])
+                dy = -XU_ELBOW_P0_DY * w2           # lower the hanging elbow (self-check knob)
+                dm = float(np.hypot(dx, dz))
+                if dm > 0.02:  # per-frame cap: no 10+ cm single-frame elbow-target jumps
+                    dx *= 0.02 / dm; dz *= 0.02 / dm
+                elbow_pos[0] += dx
+                elbow_pos[1] += dy
+                elbow_pos[2] += dz
+                # (no phi-state sync needed: the pole now points at the corrected target,
+                # so the grid's natural azimuth already is the target)
+        # output continuity guard: when the wrist passes near the shoulder the IK is
+        # ill-conditioned and the elbow can snap; halve any >12 cm single-frame move.
+        if prev is not None and elbow_pos is not None:
+            d_e = float(np.linalg.norm(elbow_pos - prev))
+            if d_e > 0.12:
+                elbow_pos = prev + 0.5 * (elbow_pos - prev)
+        new_prev[side] = elbow_pos
+        fore_dir = wrist_pos - elbow_pos
+        elbow_quat = _forearm_frame_quat(fore_dir) if float(np.linalg.norm(fore_dir)) > 1e-6 \
+            else np.asarray(body[side + "_Elbow"][1], dtype=float)
+        geo_calib = template.geo_to_elbow.get(side)
+        if geo_calib is not None:
+            elbow_quat = _qmul(elbow_quat, geo_calib)
+        # continuity limit: if the elbow frame flipped ~180 deg vs the previous frame
+        # (world-up degeneracy of the geometric forearm frame), flip it back about the
+        # forearm axis so the elbow never appears to snap outward.
+        prev_q = new_prev.get(side + "_q")
+        if prev_q is not None and _quat_angle(elbow_quat, prev_q) > np.pi / 2:
+            fh = float(np.linalg.norm(fore_dir))
+            elbow_quat = _flip_about_axis(elbow_quat, fore_dir / fh) if fh > 1e-6 else prev_q
+        new_prev[side + "_q"] = _qnormalize(elbow_quat)
+        body[side + "_Elbow"] = [elbow_pos.tolist(), _qnormalize(elbow_quat).tolist()]
+        body[side + "_Wrist"] = [wrist_pos.tolist(), _qnormalize(wrist_quat).tolist()]
+        body[side + "_Hand"] = [wrist_pos.tolist(), _qnormalize(wrist_quat).tolist()]
+
+    upper = {name: body[name] for name in UPPER_BODY_JOINT_NAMES}
+    return upper, new_prev
+
+
+def facing_yaw(headset7, synth_rh, prev_yaw=None):
+    """Yaw (rad) so the robot's model-forward (+x) faces the operator.
+
+    The raw headset forward (+z, Unity frame) is mapped to the GMR right-handed frame,
+    projected onto the horizontal plane, and the sign is disambiguated by the synthesized
+    skeleton's left/right side: if the human's left wrist lies on the robot-left side of
+    the pelvis, the robot faces the operator; otherwise it is facing their back (+= pi).
+
+    Robustness (deadband + continuity): when the left wrist is near the body centerline
+    (crossed arms / hands in front) the dot-product sign is noise and can flip the facing
+    by 180 deg frame-to-frame, swinging the whole arm; in that case (and for any >90 deg
+    step) the previous yaw is kept.
+    """
+    rot_mat = np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]])
+    rot_quat = R.from_matrix(rot_mat).as_quat(scalar_first=True)
+    q_raw = np.asarray([headset7[6], headset7[3], headset7[4], headset7[5]], dtype=float)
+    q_rh = quat_mul_np(rot_quat, q_raw, scalar_first=True)
+    f = R.from_quat(q_rh, scalar_first=True).apply([0.0, 0.0, 1.0])
+    fh = f.copy()
+    fh[2] = 0.0
+    n = float(np.linalg.norm(fh))
+    base = 0.0
+    if n > 1e-3:
+        fh /= n
+        base = float(np.arctan2(fh[1], fh[0]))
+    left = np.array([-np.sin(base), np.cos(base), 0.0])
+    pel = np.asarray(synth_rh["Pelvis"][0], dtype=float)
+    lw = np.asarray(synth_rh["Left_Wrist"][0], dtype=float)
+    side = float(np.dot(lw - pel, left))
+    if side < -0.04:
+        base += np.pi
+    elif abs(side) <= 0.04 and prev_yaw is not None:
+        base = prev_yaw  # ambiguous crossing: keep the previous facing
+    yaw = float(np.arctan2(np.sin(base), np.cos(base)))
+    if prev_yaw is not None:
+        dy = float(np.arctan2(np.sin(yaw - prev_yaw), np.cos(yaw - prev_yaw)))
+        if abs(dy) > np.pi / 2:
+            return prev_yaw  # reject a 180-deg flip
+        yaw = prev_yaw + 0.5 * dy  # half-step toward the new yaw (smooth)
+    return yaw
+
+
 class XRobotStreamer:
-    def __init__(self):
+    def __init__(self, template_path=None, human_height=1.7, upper_body_only=False, debug=False,
+                 elbow_prior_path=None):
         xrt.init()
+        self.template_path = template_path or DEFAULT_TEMPLATE_PATH
+        self.human_height = human_height
+        self.upper_body_only = upper_body_only
+        self.debug = debug
+        self.elbow_prior = None
+        if elbow_prior_path:
+            try:
+                from .elbow_prior import ElbowPrior
+                self.elbow_prior = ElbowPrior.load(elbow_prior_path)
+                print(f"[XRobotStreamer] elbow prior loaded: {elbow_prior_path}")
+            except Exception as e:
+                print(f"[XRobotStreamer] failed to load elbow prior {elbow_prior_path}: {e}")
+
+        template = StandingTemplate.load(self.template_path)
+        if template is None:
+            print(f"[XRobotStreamer] 未找到模板 {self.template_path}，使用参数化默认站姿 (h={human_height})")
+            template = StandingTemplate.parametric(human_height)
+        self.template = template
+        self.prev_elbows = {}
 
         # Joint names for reference
         self.body_joint_names = [
@@ -135,19 +802,85 @@ class XRobotStreamer:
         else:
             raise Exception("Body tracking data is not available!")
     
-    def get_processed_body_data(self, use_hands=False):
+    def set_upper_body_only(self, flag):
+        self.upper_body_only = bool(flag)
 
-        body_poses, body_velocities, body_accelerations, imu_timestamps, body_timestamp = self.get_raw_body_data()
+    def close(self):
+        """Release the PICO SDK (must be called before process exit, else std::terminate)."""
+        try:
+            xrt.close()
+        except Exception as e:
+            print(f"[XRobotStreamer] close failed: {e}")
 
+    def _build_raw_body_dict(self):
+        """Build the body joint dict (raw PICO frame) from live body tracking data."""
+        body_poses, _, _, _, _ = self.get_raw_body_data()
         if body_poses is None:
             return None
-        
-        # convert to body_pose_dict
         body_pose_dict = {}
         for i, joint_name in enumerate(self.body_joint_names):
-            pos = [body_poses[i][0], body_poses[i][1], body_poses[i][2]] # xyz
-            rot = [body_poses[i][6], body_poses[i][3], body_poses[i][4], body_poses[i][5]] # scalar first wxyz
+            pos = [body_poses[i][0], body_poses[i][1], body_poses[i][2]]  # xyz
+            rot = [body_poses[i][6], body_poses[i][3], body_poses[i][4], body_poses[i][5]]  # scalar first
             body_pose_dict[joint_name] = [pos, rot]
+        return body_pose_dict
+
+    def _extract_upper_body(self, body_dict):
+        """Take the 9 upper-body joints from a full 24-joint dict (raw PICO frame)."""
+        return {name: body_dict[name] for name in UPPER_BODY_JOINT_NAMES if name in body_dict}
+
+    def _live_body_is_sane(self, raw_body):
+        """Reject degenerate live body frames (pelvis above head, invalid quats)."""
+        if raw_body is None:
+            return False
+        head = np.asarray(raw_body["Head"][0], dtype=float)
+        pelvis = np.asarray(raw_body["Pelvis"][0], dtype=float)
+        if pelvis[1] > head[1] - 0.15:  # raw PICO frame: y up, pelvis below head
+            return False
+        for name in UPPER_BODY_JOINT_NAMES:
+            q = np.asarray(raw_body[name][1], dtype=float)
+            if abs(float(np.linalg.norm(q)) - 1.0) > 0.1:
+                return False
+        return True
+
+    def _make_upper_synth_body(self):
+        """Synthesize the 9-joint upper body from live head + controllers + standing template."""
+        headset_pose = xrt.get_headset_pose()
+        if not _pose7_valid(headset_pose):
+            return None
+        head_q = np.asarray(headset_pose[3:7], dtype=float)
+        if abs(float(np.linalg.norm(head_q)) - 1.0) > 0.05:  # reject non-unit head quat
+            return None
+        left_pose = xrt.get_left_controller_pose()
+        right_pose = xrt.get_right_controller_pose()
+        body, self.prev_elbows = synthesize_upper_body(
+            headset_pose, left_pose, right_pose, self.template, self.prev_elbows,
+            elbow_prior=self.elbow_prior)
+        return body
+
+    def get_upper_body_dict(self):
+        """9-joint upper body (raw PICO frame): extract from live full body when available
+        and sane, otherwise synthesize from headset + controllers + template."""
+        raw = self._build_raw_body_dict()
+        if raw is not None and self._live_body_is_sane(raw):
+            return self._extract_upper_body(raw)
+        return self._make_upper_synth_body()
+
+    def get_processed_body_data(self, use_hands=False):
+
+        if self.upper_body_only:
+            body_pose_dict = self.get_upper_body_dict()
+        else:
+            body_poses, _, _, _, _ = self.get_raw_body_data()
+            if body_poses is None:
+                return None
+            body_pose_dict = {}
+            for i, joint_name in enumerate(self.body_joint_names):
+                pos = [body_poses[i][0], body_poses[i][1], body_poses[i][2]]  # xyz
+                rot = [body_poses[i][6], body_poses[i][3], body_poses[i][4], body_poses[i][5]]  # scalar first
+                body_pose_dict[joint_name] = [pos, rot]
+
+        if body_pose_dict is None:
+            return None
 
         # from unity coordinate to right-hand coordinate
         body_pose_dict = self.coordinate_transform_unity_data(body_pose_dict).copy()

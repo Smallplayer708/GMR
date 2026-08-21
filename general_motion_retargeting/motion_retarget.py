@@ -170,52 +170,87 @@ class GeneralMotionRetargeting:
                 task.set_target(mink.SE3.from_rotation_and_translation(mink.SO3(rot), pos))
             
             
-    def retarget(self, human_data, offset_to_ground=False):
+    def _clamp_wrist_reach(self, reach):
+        """Clamp wrist task target positions to the robot's arm reach from its shoulder base.
+
+        Unreachable wrist targets would otherwise drive the shoulder joints into their limits
+        (collapsing the arm posture); clamping extends the arm naturally toward the target.
+        """
+        model = self.configuration.model
+        mj.mj_forward(model, self.configuration.data)
+        for side, shoulder_body in (("left", "left_shoulder_yaw_link"),
+                                    ("right", "right_shoulder_yaw_link")):
+            sh = self.configuration.data.xpos[model.body(shoulder_body).id]
+            for table in (self.human_body_to_task1, self.human_body_to_task2):
+                task = table.get(side + "_wrist_yaw_link")
+                if task is None:
+                    continue
+                t = task.target
+                tr = np.asarray(t.translation, dtype=float)
+                d = tr - sh
+                dist = float(np.linalg.norm(d))
+                if dist > reach:
+                    new_tr = sh + d / dist * reach
+                    task.set_target(mink.SE3.from_rotation_and_translation(t.rotation, new_tr))
+
+    def retarget(self, human_data, offset_to_ground=False, anchor_root=False, freeze_dofs=(),
+                 wrist_reach=None, root_yaw=None, aux_tasks=(), aux_constraints=(),
+                 pre_solve_hook=None):
         # Update the task targets
         self.update_targets(human_data, offset_to_ground)
+        # align the (frozen) root so the robot's model-forward (+x) faces the operator;
+        # anchor_root freezes the velocity, so this yaw is kept for the whole solve
+        if root_yaw is not None:
+            self.configuration.data.qpos[3:7] = np.array(
+                [np.cos(root_yaw / 2.0), 0.0, 0.0, np.sin(root_yaw / 2.0)])
+        if wrist_reach is not None:
+            self._clamp_wrist_reach(wrist_reach)
+
+        def _solve(tasks):
+            """One incremental QP IK step; optionally freeze the floating base (first 6 DOF)
+            and extra lower-body DOFs (e.g. waist) so the robot stays planted."""
+            dt = self.configuration.model.opt.timestep
+            if pre_solve_hook is not None:
+                pre_solve_hook(self.configuration, self)
+            solve_tasks = list(tasks) + list(aux_tasks)
+            vel = mink.solve_ik(
+                self.configuration, solve_tasks, dt, self.solver, self.damping, self.ik_limits,
+                constraints=aux_constraints or None
+            )
+            if anchor_root and len(vel) >= 6:
+                vel = vel.copy()
+                vel[:6] = 0.0  # fixed-base IK: the free-joint root never moves
+            if freeze_dofs:
+                vel = vel.copy()
+                for d in freeze_dofs:
+                    vel[d] = 0.0
+            self.configuration.integrate_inplace(vel, dt)
+            return vel
 
         if self.use_ik_match_table1:
             # Solve the IK problem
             curr_error = self.error1()
-            dt = self.configuration.model.opt.timestep
-            vel1 = mink.solve_ik(
-                self.configuration, self.tasks1, dt, self.solver, self.damping, self.ik_limits
-            )
-            self.configuration.integrate_inplace(vel1, dt)
+            _solve(self.tasks1)
             next_error = self.error1()
             num_iter = 0
             while curr_error - next_error > 0.001 and num_iter < self.max_iter:
                 curr_error = next_error
-                dt = self.configuration.model.opt.timestep
-                vel1 = mink.solve_ik(
-                    self.configuration, self.tasks1, dt, self.solver, self.damping, self.ik_limits
-                )
-                self.configuration.integrate_inplace(vel1, dt)
+                _solve(self.tasks1)
                 next_error = self.error1()
                 num_iter += 1
 
         if self.use_ik_match_table2:
             curr_error = self.error2()
-            dt = self.configuration.model.opt.timestep
-            vel2 = mink.solve_ik(
-                self.configuration, self.tasks2, dt, self.solver, self.damping, self.ik_limits
-            )
-            self.configuration.integrate_inplace(vel2, dt)
+            _solve(self.tasks2)
             next_error = self.error2()
             num_iter = 0
             while curr_error - next_error > 0.001 and num_iter < self.max_iter:
                 curr_error = next_error
                 # Solve the IK problem with the second task
-                dt = self.configuration.model.opt.timestep
-                vel2 = mink.solve_ik(
-                    self.configuration, self.tasks2, dt, self.solver, self.damping, self.ik_limits
-                )
-                self.configuration.integrate_inplace(vel2, dt)
-                
+                _solve(self.tasks2)
                 next_error = self.error2()
                 num_iter += 1
-                
-            
+
         return self.configuration.data.qpos.copy()
 
 
